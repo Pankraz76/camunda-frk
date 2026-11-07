@@ -8,6 +8,7 @@
 package io.camunda.zeebe.backup.s3;
 
 import io.camunda.zeebe.backup.api.NamedFileSet;
+import io.camunda.zeebe.backup.common.BackupReadRateLimiter;
 import io.camunda.zeebe.backup.common.NamedFileSetImpl;
 import io.camunda.zeebe.backup.common.SemaphoreLeasedScheduler;
 import io.camunda.zeebe.backup.s3.S3BackupStoreException.BackupCompressionFailed;
@@ -20,7 +21,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -45,17 +48,28 @@ final class FileSetManager {
 
   private final S3AsyncClient client;
   private final S3BackupConfig config;
+  private final int maxConcurrentUploads;
   private final Semaphore concurrencyLimit;
   private final ExecutorService schedulerExecutor;
+  private final BackupReadRateLimiter readRateLimiter;
 
   public FileSetManager(final S3AsyncClient client, final S3BackupConfig config) {
+    this(client, config, BackupReadRateLimiter.shared(config.maxReadRate()));
+  }
+
+  FileSetManager(
+      final S3AsyncClient client,
+      final S3BackupConfig config,
+      final BackupReadRateLimiter readRateLimiter) {
     this.client = client;
     this.config = config;
+    this.readRateLimiter = readRateLimiter;
     // We try not to exhaust the available connections by restricting the number of
     // concurrent uploads to half of the number of available connections.
     // This should prevent ConnectionAcquisitionTimeout for backups with many and/or large files
     // where we would otherwise occupy all connections, preventing some uploads from starting.
-    concurrencyLimit = new Semaphore(Math.max(1, config.maxConcurrentConnections() / 2));
+    maxConcurrentUploads = Math.max(1, config.maxConcurrentConnections() / 2);
+    concurrencyLimit = new Semaphore(maxConcurrentUploads);
     schedulerExecutor =
         Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("zeebe-backup-s3-", 0).factory());
@@ -94,11 +108,16 @@ final class FileSetManager {
       LOG.trace("Saving file {}({}) in prefix {}", fileName, filePath, prefix);
       // Use InputStream instead of File to bypass AWS SDK's file modification time
       // check: https://github.com/camunda/camunda/issues/44035
-      try (final var inputStream = Files.newInputStream(filePath)) {
+      try (final var inputStream = readRateLimiter.wrap(Files.newInputStream(filePath))) {
         final var fileSize = Files.size(filePath);
+        final var apiCallTimeout = limitedApiCallTimeout(fileSize);
         client
             .putObject(
-                put -> put.bucket(config.bucketName()).key(prefix + fileName),
+                put -> {
+                  put.bucket(config.bucketName()).key(prefix + fileName);
+                  apiCallTimeout.ifPresent(
+                      timeout -> put.overrideConfiguration(c -> c.apiCallTimeout(timeout)));
+                },
                 AsyncRequestBody.fromInputStream(inputStream, fileSize, schedulerExecutor))
             .join();
       } catch (final IOException e) {
@@ -106,6 +125,22 @@ final class FileSetManager {
       }
       return FileSet.FileMetadata.none();
     }
+  }
+
+  /**
+   * The read limit slows down the upload while the request is in flight, so the configured API call
+   * timeout alone could expire before a large file has been read. Extends it by the time reading
+   * the file takes when all concurrent uploads of this store share the budget.
+   */
+  private Optional<Duration> limitedApiCallTimeout(final long fileSize) {
+    if (readRateLimiter.isUnlimited()) {
+      return Optional.empty();
+    }
+    final long readMillis =
+        Math.ceilDiv(
+            Math.multiplyExact(fileSize, maxConcurrentUploads) * 1000,
+            readRateLimiter.bytesPerSecond());
+    return config.apiCallTimeout().map(timeout -> timeout.plusMillis(readMillis));
   }
 
   private void cleanupCompressedFile(final Path compressedFile) {
@@ -131,7 +166,10 @@ final class FileSetManager {
     try {
       final var compressedFile = Files.createTempFile(TMP_COMPRESSION_PREFIX, null);
       LOG.trace("Compressing file {} to {} using {}", file, compressedFile, algorithm);
-      try (final var input = new BufferedInputStream(Files.newInputStream(file));
+      // Limiting the read of the source also paces the write of the compressed copy, which cannot
+      // be faster than the data it is compressed from.
+      try (final var input =
+              new BufferedInputStream(readRateLimiter.wrap(Files.newInputStream(file)));
           final var output = new BufferedOutputStream(Files.newOutputStream(compressedFile));
           final var compressedOutput =
               new CompressorStreamFactory().createCompressorOutputStream(algorithm, output)) {
