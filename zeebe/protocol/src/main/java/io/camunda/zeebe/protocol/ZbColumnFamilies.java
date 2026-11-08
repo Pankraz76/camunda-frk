@@ -404,7 +404,13 @@ public enum ZbColumnFamilies implements EnumValue, ScopedColumnFamily {
    * userTaskKey], so overlapping walks suspend each task once and resume can find them by an
    * ordered prefix scan from its resume cursor. Cleared when the task is resumed or deleted.
    */
-  USER_TASKS_SUSPENDED_BY_PROCESS_INSTANCE(166, PARTITION_LOCAL);
+  USER_TASKS_SUSPENDED_BY_PROCESS_INSTANCE(166, PARTITION_LOCAL),
+
+  // (multiInstanceBodyKey, index) -> input element. Stores each element of an evaluated
+  // multi-instance input collection in its own row, so a child instance can read its input element
+  // without loading the whole collection. The collection's size remains in
+  // MULTI_INSTANCE_INPUT_COLLECTION.
+  MULTI_INSTANCE_INPUT_COLLECTION_ELEMENT(167, PARTITION_LOCAL);
 
   private final int value;
   private final ColumnFamilyScope columnFamilyScope;

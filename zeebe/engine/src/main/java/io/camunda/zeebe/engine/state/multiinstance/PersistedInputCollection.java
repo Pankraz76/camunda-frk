@@ -10,31 +10,54 @@ package io.camunda.zeebe.engine.state.multiinstance;
 import io.camunda.zeebe.db.DbValue;
 import io.camunda.zeebe.msgpack.UnpackedObject;
 import io.camunda.zeebe.msgpack.property.ArrayProperty;
+import io.camunda.zeebe.msgpack.property.IntegerProperty;
 import io.camunda.zeebe.msgpack.value.StringValue;
-import io.camunda.zeebe.util.buffer.BufferUtil;
-import java.util.List;
+import java.util.Optional;
 import org.agrona.DirectBuffer;
 
+/**
+ * The size of an evaluated multi-instance input collection. The elements themselves are stored
+ * individually, see {@link PersistedInputElement}.
+ *
+ * <p>Earlier versions stored all elements inline in {@code inputCollection} and no {@code size}.
+ * Such entries are still read, but never written anymore.
+ */
 public class PersistedInputCollection extends UnpackedObject implements DbValue {
-  private static final StringValue INPUT_COLLECTION = new StringValue("inputCollection");
-  private final ArrayProperty<StringValue> inputCollectionProperty =
-      new ArrayProperty<>(INPUT_COLLECTION, StringValue::new);
+  private static final int NO_SIZE = -1;
+
+  private final ArrayProperty<StringValue> legacyInputCollectionProperty =
+      new ArrayProperty<>("inputCollection", StringValue::new);
+  private final IntegerProperty sizeProperty = new IntegerProperty("size", NO_SIZE);
 
   public PersistedInputCollection() {
-    super(0);
-    declareProperty(inputCollectionProperty);
+    super(2);
+    declareProperty(legacyInputCollectionProperty).declareProperty(sizeProperty);
   }
 
-  public List<DirectBuffer> getInputCollection() {
-    return inputCollectionProperty.stream()
-        .map(element -> BufferUtil.cloneBuffer(element.getValue()))
-        .toList();
+  public int getSize() {
+    return isLegacy() ? legacyInputCollectionProperty.size() : sizeProperty.getValue();
   }
 
-  public PersistedInputCollection setInputCollection(final List<DirectBuffer> inputCollection) {
-    inputCollectionProperty.reset();
-    inputCollection.forEach(
-        element -> inputCollectionProperty.add().wrap(BufferUtil.cloneBuffer(element)));
+  public PersistedInputCollection setSize(final int size) {
+    legacyInputCollectionProperty.reset();
+    sizeProperty.setValue(size);
     return this;
+  }
+
+  /**
+   * @return true if the elements are stored inline, as written by earlier versions
+   */
+  public boolean isLegacy() {
+    return sizeProperty.getValue() == NO_SIZE;
+  }
+
+  /**
+   * @return the inline stored element at the given index, only present for legacy entries
+   */
+  public Optional<DirectBuffer> getLegacyElement(final int index) {
+    if (!isLegacy() || index < 0 || index >= legacyInputCollectionProperty.size()) {
+      return Optional.empty();
+    }
+    return Optional.of(legacyInputCollectionProperty.get(index).getValue());
   }
 }

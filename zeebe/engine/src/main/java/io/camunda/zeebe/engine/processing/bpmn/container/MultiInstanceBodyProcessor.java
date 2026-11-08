@@ -161,24 +161,18 @@ public final class MultiInstanceBodyProcessor
     final int loopCounter =
         stateBehavior.getElementInstance(childContext).getMultiInstanceLoopCounter();
 
+    // the loop counter starts at 1
+    final var index = loopCounter - 1;
     return multiInstanceInputCollectionBehavior
-        .getInputCollection(multiInstanceBody, flowScopeContext)
+        .getInputElement(multiInstanceBody, flowScopeContext, index)
         .flatMap(
-            collection -> {
-              // the loop counter starts at 1
-              final var index = loopCounter - 1;
-              if (index < collection.size()) {
-                final var item = collection.get(index);
-                return Either.right(item);
-              } else {
-                final var incidentMessage =
-                    String.format(
-                        "Expected to read item at index %d of the multiInstanceBody input collection but it contains only %d elements. The input collection might be modified while iterating over it.",
-                        index, collection.size());
-                final var failure = new Failure(incidentMessage, ErrorType.EXTRACT_VALUE_ERROR);
-                return Either.left(failure);
-              }
-            })
+            item ->
+                item.<Either<Failure, DirectBuffer>>map(Either::right)
+                    .orElseGet(
+                        () ->
+                            multiInstanceInputCollectionBehavior
+                                .getInputCollectionSize(multiInstanceBody, flowScopeContext)
+                                .flatMap(size -> Either.left(indexOutOfBounds(index, size)))))
         .map(
             inputElement -> {
               setLoopVariables(multiInstanceBody, childContext, loopCounter, inputElement);
@@ -210,7 +204,7 @@ public final class MultiInstanceBodyProcessor
     // to remain backwards compatible we need to keep this check, as there could be existing multi
     // instance bodies that do not have an input collection stored in the state.
     return multiInstanceInputCollectionBehavior
-        .getInputCollection(element, flowScopeContext)
+        .getInputCollectionSize(element, flowScopeContext)
         .map(ok -> satisfiesCompletionConditionOrFailure.get());
   }
 
@@ -236,22 +230,22 @@ public final class MultiInstanceBodyProcessor
       }
       return;
     }
-    final var inputCollectionOrFailure =
-        multiInstanceInputCollectionBehavior.getInputCollection(element, flowScopeContext);
-    if (inputCollectionOrFailure.isLeft()) {
+    final var inputCollectionSizeOrFailure =
+        multiInstanceInputCollectionBehavior.getInputCollectionSize(element, flowScopeContext);
+    if (inputCollectionSizeOrFailure.isLeft()) {
       // this incident is un-resolvable
-      incidentBehavior.createIncident(inputCollectionOrFailure.getLeft(), childContext);
+      incidentBehavior.createIncident(inputCollectionSizeOrFailure.getLeft(), childContext);
       return;
     }
+    final int inputCollectionSize = inputCollectionSizeOrFailure.get();
 
     final ElementInstance multiInstanceElementInstance =
         stateBehavior.getElementInstance(flowScopeContext);
 
     if (loopCharacteristics.isSequential()) {
-      final var inputCollection = inputCollectionOrFailure.get();
       final var loopCounter = multiInstanceElementInstance.getMultiInstanceLoopCounter();
 
-      if (loopCounter < inputCollection.size()) {
+      if (loopCounter < inputCollectionSize) {
         createInnerInstance(element, flowScopeContext);
 
         // canBeCompleted() doesn't take the created child instance into account because
@@ -261,7 +255,6 @@ public final class MultiInstanceBodyProcessor
     }
 
     if (!childInstanceCreated && stateBehavior.canBeCompleted(childContext)) {
-      final int inputCollectionSize = inputCollectionOrFailure.get().size();
       if (isAllChildrenHasCompletedOrTerminated(
           multiInstanceElementInstance, inputCollectionSize)) {
         stateTransitionBehavior.completeElement(flowScopeContext);
@@ -283,6 +276,14 @@ public final class MultiInstanceBodyProcessor
       // all remaining child instances were terminated.
       stateTransitionBehavior.completeElement(flowScopeContext);
     }
+  }
+
+  private static Failure indexOutOfBounds(final int index, final int inputCollectionSize) {
+    return new Failure(
+        String.format(
+            "Expected to read item at index %d of the multiInstanceBody input collection but it contains only %d elements. The input collection might be modified while iterating over it.",
+            index, inputCollectionSize),
+        ErrorType.EXTRACT_VALUE_ERROR);
   }
 
   private static boolean isAllChildrenHasCompletedOrTerminated(

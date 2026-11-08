@@ -30,6 +30,7 @@ import io.camunda.zeebe.protocol.record.value.ProcessInstanceRecordValue;
 import io.camunda.zeebe.util.Either;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.agrona.DirectBuffer;
@@ -359,7 +360,12 @@ public final class BpmnStateBehavior {
     return elementInstanceState.getNumberOfTakenSequenceFlows(flowScopeKey, gatewayElementId);
   }
 
-  public Optional<List<DirectBuffer>> getInputCollection(final long multiInstanceKey) {
-    return multiInstanceState.getInputCollection(multiInstanceKey);
+  public OptionalInt getInputCollectionSize(final long multiInstanceKey) {
+    return multiInstanceState.getInputCollectionSize(multiInstanceKey);
+  }
+
+  public Optional<DirectBuffer> getInputCollectionElement(
+      final long multiInstanceKey, final int index) {
+    return multiInstanceState.getInputCollectionElement(multiInstanceKey, index);
   }
 }
